@@ -1,6 +1,7 @@
 const axios = require("axios");
 
 module.exports = async (req, res) => {
+    // Enable global CORS for media players
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
     
@@ -15,45 +16,54 @@ module.exports = async (req, res) => {
     let primarySlug = isAlternative ? "qur1" : "qur";
     let fallbackSlug = primarySlug === "qur" ? "qur1" : "qur";
 
-    // Crucial: We omit 'br' and 'zstd' so the server sends plain, readable text text to our proxy
-    const baseHeaders = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
-        "Referer": "https://www.quranradio.qa/",
-        "Origin": "https://www.quranradio.qa",
+    // 100% exact replica of your captured headers.
+    // Note: We omit "br" and "zstd" from Accept-Encoding so Axios receives clean text instead of binary chunks.
+    const strictHeaders = {
         "Accept": "*/*",
-        "Accept-Encoding": "gzip, deflate" 
+        "Accept-Encoding": "gzip, deflate",
+        "Accept-Language": "fr,ar;q=0.9,en-US;q=0.8,en;q=0.7,fr-FR;q=0.6",
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "Host": "qmcconnect.qa",
+        "Origin": "https://www.quranradio.qa",
+        "Pragma": "no-cache",
+        "Referer": "https://www.quranradio.qa/",
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "cross-site",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+        "sec-ch-ua": '"Google Chrome";v="149", "Chromium";v="149", "Not)A;Brand";v="24"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"Windows"'
     };
 
     let selectedSlug = primarySlug;
     let finalManifest = null;
 
-    // Unified connection loop across primary and fallback channels
+    // Loop through primary, fallback to alternative if primary fails
     for (let currentSlug of [primarySlug, fallbackSlug]) {
         selectedSlug = currentSlug;
-        const masterUrl = `https://qmcconnect.qa/api/StreamServices/${selectedSlug}/master.m3u8`;
-        const chunksUrl = `https://qmcconnect.qa/api/StreamServices/${selectedSlug}/chunks.m3u8`;
+        const targetUrl = `https://qmcconnect.qa/api/StreamServices/${selectedSlug}/master.m3u8`;
 
         try {
-            // STEP 1: Hit master.m3u8 first to satisfy the firewall and harvest the security cookie
-            const masterResponse = await axios.get(masterUrl, { headers: baseHeaders, timeout: 3500 });
+            // REQUEST 1 (as seen in your logs): Grab the initial cookie session
+            const res1 = await axios.get(targetUrl, { headers: strictHeaders, timeout: 3500 });
             
-            // Extract the cookie safely if provided
-            const setCookie = masterResponse.headers["set-cookie"];
-            let requestHeaders = { ...baseHeaders };
+            let authenticatedHeaders = { ...strictHeaders };
+            const setCookie = res1.headers["set-cookie"];
             if (setCookie) {
-                requestHeaders["Cookie"] = Array.isArray(setCookie) ? setCookie[0].split(";")[0] : setCookie.split(";")[0];
+                authenticatedHeaders["Cookie"] = Array.isArray(setCookie) ? setCookie[0].split(";")[0] : setCookie.split(";")[0];
             }
 
-            // STEP 2: Use the newly acquired cookie session to download the real chunks manifest
-            const chunksResponse = await axios.get(chunksUrl, { headers: requestHeaders, timeout: 3500 });
+            // REQUEST 2 (as seen in your logs): Re-hit master.m3u8 with the authenticated cookie
+            const res2 = await axios.get(targetUrl, { headers: authenticatedHeaders, timeout: 3500 });
             
-            if (chunksResponse.status === 200 && chunksResponse.data && chunksResponse.data.includes("#EXTM3U")) {
-                finalManifest = chunksResponse.data;
-                break; // Handshake completed successfully, exit loop
+            if (res2.status === 200 && res2.data && res2.data.includes("#EXTM3U")) {
+                finalManifest = res2.data;
+                break; // Success! Exit the failover loop.
             }
         } catch (e) {
-            // Log error internally and fall back to the next station slug channel loop iteration
-            finalManifest = null;
+            finalManifest = null; // Reset and let it fall back to the next slug option
         }
     }
 
@@ -62,7 +72,7 @@ module.exports = async (req, res) => {
         return res.status(502).send("Couldn't find the best station . Try again");
     }
 
-    // Rewrite relative chunk layouts into absolute secure addresses for VLC compatibility
+    // Rewrite any relative lines to absolute QMC Server URLs so VLC can access them
     const baseUrl = `https://qmcconnect.qa/api/StreamServices/${selectedSlug}/`;
     const lines = finalManifest.split("\n");
     const modifiedLines = lines.map(line => {
