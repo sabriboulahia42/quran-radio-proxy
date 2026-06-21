@@ -1,7 +1,6 @@
 const axios = require("axios");
 
 module.exports = async (req, res) => {
-    // Enable global CORS for media players
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
     
@@ -16,56 +15,56 @@ module.exports = async (req, res) => {
     let primarySlug = isAlternative ? "qur1" : "qur";
     let fallbackSlug = primarySlug === "qur" ? "qur1" : "qur";
 
+    // Crucial: We omit 'br' and 'zstd' so the server sends plain, readable text text to our proxy
     const baseHeaders = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
         "Referer": "https://www.quranradio.qa/",
         "Origin": "https://www.quranradio.qa",
-        "Accept": "*/*"
+        "Accept": "*/*",
+        "Accept-Encoding": "gzip, deflate" 
     };
 
     let selectedSlug = primarySlug;
-    let targetUrl = `https://qmcconnect.qa/api/StreamServices/${selectedSlug}/chunks.m3u8`;
-    let responseData = null;
+    let finalManifest = null;
 
-    // We cycle through both stations sequentially inside a single try block to pass cookies forward
+    // Unified connection loop across primary and fallback channels
     for (let currentSlug of [primarySlug, fallbackSlug]) {
-        targetUrl = `https://qmcconnect.qa/api/StreamServices/${currentSlug}/chunks.m3u8`;
         selectedSlug = currentSlug;
+        const masterUrl = `https://qmcconnect.qa/api/StreamServices/${selectedSlug}/master.m3u8`;
+        const chunksUrl = `https://qmcconnect.qa/api/StreamServices/${selectedSlug}/chunks.m3u8`;
 
         try {
-            // First step: Attempt to get the manifest
-            const step1 = await axios.get(targetUrl, { headers: baseHeaders, timeout: 3000 });
+            // STEP 1: Hit master.m3u8 first to satisfy the firewall and harvest the security cookie
+            const masterResponse = await axios.get(masterUrl, { headers: baseHeaders, timeout: 3500 });
             
-            if (step1.status === 200 && step1.data) {
-                responseData = step1.data;
-                
-                // If the server gave us a firewall cookie, merge it into our subsequent request headers
-                const setCookieHeader = step1.headers["set-cookie"];
-                if (setCookieHeader) {
-                    const cookieStr = Array.isArray(setCookieHeader) ? setCookieHeader.join("; ") : setCookieHeader;
-                    baseHeaders["Cookie"] = cookieStr.split(";")[0]; // Extracts the raw cookiesession1 assignment
-                }
-                
-                // Double check data authenticity by making sure it looks like a real HLS manifest
-                if (responseData.includes("#EXTM3U")) {
-                    break; 
-                }
+            // Extract the cookie safely if provided
+            const setCookie = masterResponse.headers["set-cookie"];
+            let requestHeaders = { ...baseHeaders };
+            if (setCookie) {
+                requestHeaders["Cookie"] = Array.isArray(setCookie) ? setCookie[0].split(";")[0] : setCookie.split(";")[0];
+            }
+
+            // STEP 2: Use the newly acquired cookie session to download the real chunks manifest
+            const chunksResponse = await axios.get(chunksUrl, { headers: requestHeaders, timeout: 3500 });
+            
+            if (chunksResponse.status === 200 && chunksResponse.data && chunksResponse.data.includes("#EXTM3U")) {
+                finalManifest = chunksResponse.data;
+                break; // Handshake completed successfully, exit loop
             }
         } catch (e) {
-            // If the primary channel hits a server block or error, loop cleanly to try the fallback
-            responseData = null;
+            // Log error internally and fall back to the next station slug channel loop iteration
+            finalManifest = null;
         }
     }
 
-    // Both endpoints failed to clear the firewall session
-    if (!responseData) {
+    if (!finalManifest) {
         res.setHeader("Content-Type", "text/plain; charset=utf-8");
         return res.status(502).send("Couldn't find the best station . Try again");
     }
 
-    // Rewrite relative chunks to full absolute server layouts
+    // Rewrite relative chunk layouts into absolute secure addresses for VLC compatibility
     const baseUrl = `https://qmcconnect.qa/api/StreamServices/${selectedSlug}/`;
-    const lines = responseData.split("\n");
+    const lines = finalManifest.split("\n");
     const modifiedLines = lines.map(line => {
         if (line.trim() && !line.startsWith("#") && !line.startsWith("http")) {
             return baseUrl + line;
